@@ -129,6 +129,8 @@ class Model:
 
     def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
         tensor_names_from_parts: set[str] = set()
+        quant_config = self.hparams.get("quantization_config")
+        is_bitnet_hf = isinstance(quant_config, dict) and quant_config.get("quant_method") == "bitnet"
 
         if len(self.part_names) > 1:
             self.tensor_names = set()
@@ -154,19 +156,48 @@ class Model:
                 ctx = contextlib.nullcontext(torch.load(str(self.dir_model / part_name), map_location="cpu", mmap=True, weights_only=True))
 
             with ctx as model_part:
-                tensor_names_from_parts.update(model_part.keys())
+                model_part_keys = list(model_part.keys())
+                tensor_names_from_parts.update(model_part_keys)
+                model_part_key_set = set(model_part_keys)
 
-                for name in model_part.keys():
+                for name in model_part_keys:
+                    if is_bitnet_hf and name.endswith(".weight_scale"):
+                        continue
+
                     if self.is_safetensors:
-                        if self.lazy:
+                        if is_bitnet_hf and name.endswith(".weight"):
+                            scale_name = name.removesuffix(".weight") + ".weight_scale"
+                            if scale_name in model_part_key_set:
+                                data = Model._dequant_bitnet_tensor(
+                                    model_part.get_tensor(name),
+                                    model_part.get_tensor(scale_name),
+                                )
+                            elif self.lazy:
+                                data = model_part.get_slice(name)
+                                data = LazyTorchTensor.from_safetensors_slice(data)
+                            else:
+                                data = model_part.get_tensor(name)
+                        elif self.lazy:
                             data = model_part.get_slice(name)
                             data = LazyTorchTensor.from_safetensors_slice(data)
                         else:
                             data = model_part.get_tensor(name)
                     else:
-                        data = model_part[name]
-                        if self.lazy:
-                            data = LazyTorchTensor.from_eager(data)
+                        if is_bitnet_hf and name.endswith(".weight"):
+                            scale_name = name.removesuffix(".weight") + ".weight_scale"
+                            if scale_name in model_part_key_set:
+                                data = Model._dequant_bitnet_tensor(
+                                    model_part[name],
+                                    model_part[scale_name],
+                                )
+                            else:
+                                data = model_part[name]
+                                if self.lazy:
+                                    data = LazyTorchTensor.from_eager(data)
+                        else:
+                            data = model_part[name]
+                            if self.lazy:
+                                data = LazyTorchTensor.from_eager(data)
                     yield name, data
 
         # only verify tensor name presence; it doesn't matter if they are not in the right files
@@ -200,6 +231,19 @@ class Model:
         if new_name is None:
             raise ValueError(f"Can not map tensor {name!r}")
         return new_name
+
+    @staticmethod
+    def _dequant_bitnet_tensor(weight: Tensor, scale: Tensor) -> Tensor:
+        weight = weight.view(torch.uint8)
+        orig_shape = weight.shape
+
+        shift = torch.tensor([0, 2, 4, 6], dtype=torch.uint8).reshape((4, *(1 for _ in range(len(orig_shape)))))
+        data = weight.unsqueeze(0).expand((4, *orig_shape)) >> shift
+        data = data & 3
+        data = (data.float() - 1).reshape((orig_shape[0] * 4, *orig_shape[1:]))
+
+        # Hugging Face BitNet checkpoints store the inverse scale.
+        return data / scale.float()
 
     def set_gguf_parameters(self):
         self.gguf_writer.add_block_count(self.block_count)

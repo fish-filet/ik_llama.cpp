@@ -3993,6 +3993,28 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Falcon 3 (embedded template uses <tool_call> with an array of OpenAI-style tool calls)
+    {
+        auto tst = peg_tester("models/templates/Falcon3-tool-use.jinja", detailed_debug);
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
+        tst.test("<tool_call>\n[\n  {\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n]\n</tool_call>")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call)
+            .expect_reconstruction()
+            .run();
+        tst.test("<tool_call>\n[\n  {\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}},\n  {\"name\": \"special_function_with_opt\", \"arguments\": {\"arg1\": 1, \"arg2\": 2}}\n]\n</tool_call>")
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .parallel_tool_calls(true)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+    }
+
     // Apriel 1.6 Thinker (reasoning-only support)
     {
         auto tst = peg_tester("models/templates/Apriel-1.6-15b-Thinker-fixed.jinja", detailed_debug);

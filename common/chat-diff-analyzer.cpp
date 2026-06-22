@@ -717,17 +717,25 @@ void analyze_tools::analyze_tool_call_format_json_native(const std::string & cle
     std::string cut     = clean_haystack.substr(json_start, json_end - json_start + 1);
     json call_struct    = json::parse(cut);
     auto register_field = [&](const std::string & prefix, const nlohmann::detail::iteration_proxy_value<json::iterator> & subel) {
+        bool matched = false;
+        const std::string field_name = !prefix.empty() ? prefix + "." + subel.key() : subel.key();
+
         if (subel.value().is_string() && std::string(subel.value()).find("call0000") != std::string::npos) {
-            format.id_field = !prefix.empty() ? prefix + "." + subel.key() : subel.key();
+            format.id_field = field_name;
+            matched = true;
         } else if (subel.value().is_string() && std::string(subel.value()) == fun_name_needle) {
-            format.name_field = !prefix.empty() ? prefix + "." + subel.key() : subel.key();
+            format.name_field = field_name;
+            matched = true;
         } else if (subel.value().dump().find(arg_name_needle) !=
                    std::string::npos) {  // handle both string and JSON obj variants
-            format.args_field = !prefix.empty() ? prefix + "." + subel.key() : subel.key();
+            format.args_field = field_name;
+            matched = true;
         } else if (subel.key().find("id") != std::string::npos) {
             // heuristics for generated id field
-            format.gen_id_field = !prefix.empty() ? prefix + "." + subel.key() : subel.key();
+            format.gen_id_field = field_name;
+            matched = true;
         }
+        return matched;
     };
     for (const auto & el : call_struct.items()) {
         if (el.key() == fun_name_needle) {
@@ -737,11 +745,14 @@ void analyze_tools::analyze_tool_call_format_json_native(const std::string & cle
             format.args_field.clear();
             // Don't register this element - the function name IS the key, not a field
         } else {
-            if (el.value().is_object() &&
-                el.value().dump().find(arg_name_needle) == std::string::npos) {  // not the args object
-                format.function_field = el.key();
+            bool matched_nested = false;
+            if (el.value().is_object()) {
                 for (const auto & subel : el.value().items()) {
-                    register_field(el.key(), subel);
+                    matched_nested = register_field(el.key(), subel) || matched_nested;
+                }
+                if (matched_nested) {
+                    format.function_field = el.key();
+                    continue;
                 }
             }
             // Register this element as a potential field

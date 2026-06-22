@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "json-schema-to-grammar.h"
+#include "../src/unicode.h"
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -4680,23 +4681,27 @@ std::vector<llama_token> common_tokenize(
     return llama_tokenize(vocab, text, add_special, parse_special);
 }
 
-std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
-    std::string piece;
-    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
-    const int n_chars = llama_token_to_piece(llama_get_model(ctx), token, &piece[0], piece.size(), 0, special);
-    if (n_chars < 0) {
-        piece.resize(-n_chars);
-        int check = llama_token_to_piece(llama_get_model(ctx), token, &piece[0], piece.size(), 0, special);
-        GGML_ASSERT(check == -n_chars);
-    }
-    else {
-        piece.resize(n_chars);
-    }
-
-    return piece;
+static bool common_token_needs_byte_decode(const llama_vocab * vocab, llama_token token) {
+    const auto attr = vocab->token_get_attr(token);
+    return (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
 }
 
-std::string llama_token_to_piece(const struct llama_model* model, llama_token token, bool special) {
+static std::string common_decode_raw_token_piece(const std::string & piece) {
+    std::string decoded;
+    for (const auto cpt : unicode_cpts_from_utf8(piece)) {
+        const auto utf8 = unicode_cpt_to_utf8(cpt);
+        try {
+            decoded.push_back((char) unicode_utf8_to_byte(utf8));
+        } catch (const std::out_of_range &) {
+            decoded += utf8;
+        }
+    }
+    return decoded;
+}
+
+std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
     std::string piece;
     piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
     const int n_chars = llama_token_to_piece(model, token, &piece[0], piece.size(), 0, special);
@@ -4709,6 +4714,29 @@ std::string llama_token_to_piece(const struct llama_model* model, llama_token to
         piece.resize(n_chars);
     }
 
+    if (common_token_needs_byte_decode(vocab, token)) {
+        return common_decode_raw_token_piece(piece);
+    }
+    return piece;
+}
+
+std::string llama_token_to_piece(const struct llama_model* model, llama_token token, bool special) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::string piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece(model, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(model, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    }
+    else {
+        piece.resize(n_chars);
+    }
+
+    if (common_token_needs_byte_decode(vocab, token)) {
+        return common_decode_raw_token_piece(piece);
+    }
     return piece;
 }
 
@@ -4746,6 +4774,9 @@ std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token 
         piece.resize(n_chars);
     }
 
+    if (common_token_needs_byte_decode(vocab, token)) {
+        return common_decode_raw_token_piece(piece);
+    }
     return piece;
 }
 

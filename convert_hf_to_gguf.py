@@ -580,6 +580,31 @@ class Model:
     #       do not modify it manually!
     # ref:  https://github.com/ggerganov/llama.cpp/pull/6920
     # Marker: Start get_vocab_base_pre
+    def _guess_vocab_base_pre_from_local_files(self) -> str | None:
+        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
+        if not tokenizer_config_file.is_file():
+            return None
+
+        try:
+            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+                tokenizer_config_json = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        chat_template = tokenizer_config_json.get("chat_template")
+        model_hint_parts = [
+            str(self.hparams.get("_name_or_path", "")),
+            str(tokenizer_config_json.get("name_or_path", "")),
+        ]
+        model_hint = " ".join(part for part in model_hint_parts if part).lower()
+
+        if isinstance(chat_template, str) and "falcon assistant" in chat_template.lower():
+            return "falcon3"
+        if "falcon3" in model_hint:
+            return "falcon3"
+
+        return None
+
     def get_vocab_base_pre(self, tokenizer) -> str:
         # encoding this string and hashing the resulting tokens would (hopefully) give us a unique identifier that
         # is specific for the BPE pre-tokenizer used by the model
@@ -707,6 +732,8 @@ class Model:
         if chkhsh == "9dcf830ee9990cdbf78cc523a5f7bd9ad8f3f9890c2d3581d2785ad10f07049d":
             # ref: https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Base
             res = "mellum2"
+        if res is None:
+            res = self._guess_vocab_base_pre_from_local_files()
         if res is None:
             logger.warning("\n")
             logger.warning("**************************************************************************************")

@@ -2,6 +2,7 @@
 #include "llama-vocab.h"
 #include "llama-vocab.h"
 #include "llama-sampling.h"
+#include "unicode.h"
 
 #include <cmath>
 #include <algorithm>
@@ -13,6 +14,43 @@
 //
 // helpers
 //
+
+static bool llama_grammar_token_needs_detokenize(const llama_vocab * vocab, llama_token token) {
+    const auto attr = vocab->token_get_attr(token);
+    return (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+}
+
+static std::string llama_grammar_decode_piece(const std::string & piece) {
+    std::string decoded;
+    for (const auto cpt : unicode_cpts_from_utf8(piece)) {
+        const auto utf8 = unicode_cpt_to_utf8(cpt);
+        try {
+            decoded.push_back((char) unicode_utf8_to_byte(utf8));
+        } catch (const std::out_of_range &) {
+            decoded += utf8;
+        }
+    }
+    return decoded;
+}
+
+static std::string llama_grammar_token_text(const llama_vocab * vocab, llama_token token) {
+    if (!llama_grammar_token_needs_detokenize(vocab, token)) {
+        return vocab->token_to_piece(token);
+    }
+
+    std::string piece;
+    char tmp[64];
+    int32_t n_chars = llama_detokenize(vocab, &token, 1, tmp, sizeof(tmp), false, true);
+    if (n_chars < 0) {
+        std::string text(-n_chars, '\0');
+        n_chars = llama_detokenize(vocab, &token, 1, text.data(), text.size(), false, true);
+        GGML_ASSERT(n_chars == (int32_t) text.size());
+        return llama_grammar_decode_piece(text);
+    }
+
+    piece.assign(tmp, n_chars);
+    return llama_grammar_decode_piece(piece);
+}
 
 // NOTE: assumes valid utf8 (but checks for overrun)
 static std::pair<uint32_t, const char*> decode_utf8(const char* src) {
@@ -1398,7 +1436,7 @@ void llama_grammar_sample_impl(const struct llama_grammar * grammar, const struc
 
     for (size_t i = 0; i < candidates->size; ++i) {
         const llama_token id      = candidates->data[i].id;
-        const std::string & piece = vocab->token_to_piece(id);
+        const std::string piece   = llama_grammar_token_text(vocab, id);
 
         if (vocab->is_eog(id)) {
             if (!allow_eog) {
@@ -1424,7 +1462,7 @@ void llama_grammar_sample_impl(const struct llama_grammar * grammar, const struc
 void llama_grammar_accept_impl(struct llama_grammar & grammar, const struct llama_vocab * vocab, const struct llama_sampling * smpl, llama_token token) {
     const int64_t t_start_sample_us = ggml_time_us();
     GGML_ASSERT(grammar.vocab != nullptr);
-    const auto& piece = grammar.vocab->token_to_piece(token);
+    const auto piece = llama_grammar_token_text(grammar.vocab, token);
 
     if (grammar.awaiting_trigger) {
         if (std::find(grammar.trigger_tokens.begin(), grammar.trigger_tokens.end(), token) != grammar.trigger_tokens.end()) {
@@ -1553,4 +1591,3 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
         throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece + " (" + std::to_string(token) + ")");
     }
 }
-

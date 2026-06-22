@@ -2,9 +2,12 @@
 #include "chat-auto-parser.h"
 #include "chat-peg-parser.h"
 #include "chat.h"
+#include "sampling.h"
 #include "peg-parser.h"
+#include "../src/llama-grammar.h"
 #include "testing.h"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -64,6 +67,10 @@ static void test_cohere_analysis(testing & t);
 
 // SmolLM3 template analysis tests
 static void test_smollm3_analysis(testing & t);
+static void test_falcon3_embedded_template_analysis(testing & t);
+static void test_falcon3_runtime_template_server_params(testing & t);
+static void test_falcon3_runtime_template_analysis(testing & t);
+static void test_falcon3_runtime_sampler_prefill(testing & t);
 
 // Marker separation
 static void test_marker_separation(testing & t);
@@ -100,6 +107,10 @@ int main(int argc, char * argv[]) {
     t.test("cohere", test_cohere_analysis);
     t.test("nemotron", test_nemotron_analysis);
     t.test("smollm3", test_smollm3_analysis);
+    t.test("falcon3_embedded", test_falcon3_embedded_template_analysis);
+    t.test("falcon3_runtime_analysis", test_falcon3_runtime_template_analysis);
+    t.test("falcon3_runtime", test_falcon3_runtime_template_server_params);
+    t.test("falcon3_runtime_prefill", test_falcon3_runtime_sampler_prefill);
     t.test("standard_json_tools", test_standard_json_tools_formats);
     t.test("normalize_quotes_to_json", test_normalize_quotes_to_json);
     t.test("tagged_args_embedded_quotes", test_tagged_args_with_embedded_quotes);
@@ -1293,6 +1304,17 @@ static common_chat_template load_template(testing & t, const std::string & templ
     return tmpl;
 }
 
+static std::string load_template_source(testing & t, const std::string & template_path) {
+    std::ifstream fin(template_path, std::ios::binary);
+    std::ostringstream buf;
+    if (fin.is_open()) {
+        buf << fin.rdbuf();
+    }
+    std::string template_source = buf.str();
+    t.assert_true("template source loaded successfully", template_source.length() > 0);
+    return template_source;
+}
+
 // ============================================================================
 // Nemotron Template Analysis Tests
 // ============================================================================
@@ -1491,6 +1513,184 @@ static void test_smollm3_reasoning_detection(testing & t) {
     bool has_think_end = std::find(analysis.preserved_tokens.begin(), analysis.preserved_tokens.end(), "</think>") != analysis.preserved_tokens.end();
     t.assert_true("preserved_tokens should contain '<think>'", has_think_start);
     t.assert_true("preserved_tokens should contain '</think>'", has_think_end);
+}
+
+static void test_falcon3_embedded_template_analysis(testing & t) {
+    common_chat_template tmpl = load_template(t, "models/templates/Falcon3-tool-use-embedded.jinja");
+
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+
+    t.assert_equal("tool format should be JSON_NATIVE", tool_format::JSON_NATIVE, analysis.tools.format.mode);
+    t.assert_equal("tool_section_start should be '<tool_call>\\n'", "<tool_call>\n", analysis.tools.format.section_start);
+    t.assert_equal("tool_section_end should be '</tool_call>'", "</tool_call>", analysis.tools.format.section_end);
+    t.assert_equal("per_call_start should be empty", "", analysis.tools.format.per_call_start);
+    t.assert_equal("per_call_end should be empty", "", analysis.tools.format.per_call_end);
+    t.assert_true("tool calls should be array wrapped", analysis.tools.format.tools_array_wrapped);
+    t.assert_equal("name_field should be 'function.name'", "function.name", analysis.tools.format.name_field);
+    t.assert_equal("args_field should be 'function.arguments'", "function.arguments", analysis.tools.format.args_field);
+    t.assert_equal("id_field should be 'id'", "id", analysis.tools.format.id_field);
+}
+
+static void test_falcon3_runtime_template_server_params(testing & t) {
+    auto template_source = load_template_source(t, "models/templates/Falcon3-tool-use.jinja");
+    auto tmpls = common_chat_templates_init(/* model = */ nullptr, template_source, "", "");
+    t.assert_true("Falcon3 runtime templates initialized", tmpls != nullptr);
+
+    common_chat_msg user_msg;
+    user_msg.role = "user";
+    user_msg.content = "Use the provided function to add 17 and 25.";
+
+    common_chat_tool add_numbers_tool;
+    add_numbers_tool.name = "add_numbers";
+    add_numbers_tool.description = "Add two integers and return the sum.";
+    add_numbers_tool.parameters = R"({
+        "type": "object",
+        "properties": {
+            "a": { "type": "integer" },
+            "b": { "type": "integer" }
+        },
+        "required": ["a", "b"]
+    })";
+
+    common_chat_templates_inputs inputs;
+    inputs.use_jinja = true;
+    inputs.add_generation_prompt = true;
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    inputs.parallel_tool_calls = true;
+    inputs.messages = { user_msg };
+    inputs.tools = { add_numbers_tool };
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+
+    t.assert_equal("generation prompt should be '<|assistant|>\\n'", "<|assistant|>\n", params.generation_prompt);
+    t.assert_true("generated grammar should not be empty", !params.grammar.empty());
+    t.assert_true("grammar should mention <tool_call>", params.grammar.find("<tool_call>") != std::string::npos);
+    t.assert_true("grammar should use arguments field", params.grammar.find("arguments") != std::string::npos);
+
+    std::unique_ptr<llama_grammar, decltype(&llama_grammar_free_impl)> grammar(
+        llama_grammar_init_impl(nullptr, params.grammar.c_str(), "root", false, nullptr, 0, nullptr, 0),
+        llama_grammar_free_impl);
+    t.assert_true("generated grammar should initialize", grammar != nullptr);
+}
+
+static void test_falcon3_runtime_template_analysis(testing & t) {
+    common_chat_template tmpl = load_template(t, "models/templates/Falcon3-tool-use.jinja");
+
+    struct autoparser analysis;
+    analysis.analyze_template(tmpl);
+
+    t.assert_equal("tool format should be JSON_NATIVE", tool_format::JSON_NATIVE, analysis.tools.format.mode);
+    t.assert_equal("tool_section_start should be '<tool_call>\\n'", "<tool_call>\n", analysis.tools.format.section_start);
+    t.assert_equal("tool_section_end should be '</tool_call>'", "</tool_call>", analysis.tools.format.section_end);
+    t.assert_true("tool calls should be array wrapped", analysis.tools.format.tools_array_wrapped);
+    t.assert_equal("name_field should be 'name'", "name", analysis.tools.format.name_field);
+    t.assert_equal("args_field should be 'arguments'", "arguments", analysis.tools.format.args_field);
+    t.assert_equal("id_field should be empty", "", analysis.tools.format.id_field);
+    t.assert_equal("function_field should be 'function'", "function", analysis.tools.format.function_field);
+}
+
+static void test_falcon3_runtime_sampler_prefill(testing & t) {
+    const std::filesystem::path model_path = "../../qat-training/falcon3-7b-1.58-reference/ggml-model-iq2_bn.gguf";
+    if (!std::filesystem::exists(model_path)) {
+        t.assert_true("Falcon3 GGUF is optional for this local-only test", true);
+        return;
+    }
+
+    auto template_source = load_template_source(t, "models/templates/Falcon3-tool-use.jinja");
+    auto tmpls = common_chat_templates_init(/* model = */ nullptr, template_source, "", "");
+    t.assert_true("Falcon3 runtime templates initialized", tmpls != nullptr);
+
+    common_chat_msg user_msg;
+    user_msg.role = "user";
+    user_msg.content = "Use the provided function to add 17 and 25.";
+
+    common_chat_tool add_numbers_tool;
+    add_numbers_tool.name = "add_numbers";
+    add_numbers_tool.description = "Add two integers and return the sum.";
+    add_numbers_tool.parameters = R"({
+        "type": "object",
+        "properties": {
+            "a": { "type": "integer" },
+            "b": { "type": "integer" }
+        },
+        "required": ["a", "b"]
+    })";
+
+    common_chat_templates_inputs inputs;
+    inputs.use_jinja = true;
+    inputs.add_generation_prompt = true;
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    inputs.parallel_tool_calls = true;
+    inputs.messages = { user_msg };
+    inputs.tools = { add_numbers_tool };
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+
+    auto mparams = llama_model_default_params();
+    mparams.vocab_only = true;
+    std::unique_ptr<llama_model, decltype(&llama_free_model)> model(
+        llama_model_load_from_file(model_path.c_str(), mparams),
+        llama_free_model);
+    t.assert_true("Falcon3 vocab-only model loaded", model != nullptr);
+    if (!model) {
+        return;
+    }
+
+    common_params_sampling sparams;
+    sparams.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, params.grammar);
+    sparams.grammar_lazy = false;
+    sparams.generation_prompt = params.generation_prompt;
+
+    auto * vocab = llama_model_get_vocab(model.get());
+    std::unique_ptr<llama_grammar, decltype(&llama_grammar_free_impl)> grammar(
+        llama_grammar_init_impl(vocab, params.grammar.c_str(), "root", false, nullptr, 0, nullptr, 0),
+        llama_grammar_free_impl);
+    t.assert_true("Falcon3 sampler grammar initialized", grammar != nullptr);
+    if (!grammar) {
+        return;
+    }
+
+    auto prefill_tokens = common_tokenize(vocab, params.generation_prompt, false, true);
+    std::string decoded_generation_prompt;
+    for (const auto & token : prefill_tokens) {
+        decoded_generation_prompt += common_token_to_piece(vocab, token, true);
+    }
+    t.assert_equal("token-wise Falcon3 detokenization should preserve assistant prompt newline", params.generation_prompt, decoded_generation_prompt);
+
+    const std::string tool_call_prefix = "<tool_call>\n";
+    auto tool_call_prefix_tokens = common_tokenize(vocab, tool_call_prefix, false, true);
+    std::string decoded_tool_call_prefix;
+    for (const auto & token : tool_call_prefix_tokens) {
+        decoded_tool_call_prefix += common_token_to_piece(vocab, token, true);
+    }
+    t.assert_equal("token-wise Falcon3 detokenization should preserve tool-call delimiter newline", tool_call_prefix, decoded_tool_call_prefix);
+
+    for (const auto & token : prefill_tokens) {
+        try {
+            llama_grammar_accept_impl(*grammar, vocab, nullptr, token);
+        } catch (const std::exception & e) {
+            std::cerr
+                << "Falcon3 manual prefill failed on token "
+                << token
+                << " special_piece='"
+                << common_token_to_piece(vocab, token, true)
+                << "' exception="
+                << e.what()
+                << "\n";
+            break;
+        }
+    }
+
+    try {
+        std::unique_ptr<common_sampler, decltype(&common_sampler_free)> sampler(
+            common_sampler_init(model.get(), sparams),
+            common_sampler_free);
+        t.assert_true("common_sampler_init should succeed for Falcon3 tool grammar prefill", sampler != nullptr);
+    } catch (const std::exception & e) {
+        std::cerr << "Falcon3 sampler prefill exception: " << e.what() << "\n";
+        t.assert_true("common_sampler_init should succeed for Falcon3 tool grammar prefill", false);
+    }
 }
 
 // ============================================================================
@@ -1966,4 +2166,3 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
         }
     }
 }
-

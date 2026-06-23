@@ -3725,6 +3725,8 @@ class Gemma4Model(Gemma4BaseModel):
         yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), rope_freqs_full)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        original_name = name
+
         if name.endswith("per_dim_scale") or name.endswith("layer_scalar"):
             name = name + ".weight"
 
@@ -3745,6 +3747,13 @@ class Gemma4Model(Gemma4BaseModel):
 
         if ".experts." in name and not name.endswith(".weight"):
             name += ".weight"
+
+        if name.endswith("pre_feedforward_layernorm.weight"):
+            canonical_name = original_name.replace("pre_feedforward_layernorm.weight", "ffn_norm.weight")
+            # Some Gemma4 checkpoints expose the same FFN norm through both names.
+            if self.tensor_names is not None and canonical_name in self.tensor_names:
+                logger.info("Skipping Gemma4 alias tensor %r because %r is present", original_name, canonical_name)
+                return []
 
         return [(self.map_tensor_name(name), data_torch)]
 

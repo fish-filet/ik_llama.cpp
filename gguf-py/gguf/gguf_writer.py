@@ -175,6 +175,8 @@ class GGUFWriter:
 
         if self.path is not None:
             filenames = self.print_plan()
+            for filename in filenames:
+                filename.parent.mkdir(parents=True, exist_ok=True)
             self.fout = [open(filename, "wb") for filename in filenames]
             self.state = WriterState.EMPTY
 

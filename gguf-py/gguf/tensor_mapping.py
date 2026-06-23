@@ -693,6 +693,22 @@ class TensorNameMap:
                 "model.layers.{bid}.post_attention_layernorm",
             ),
         },
+        MODEL_ARCH.GEMMA4: {
+            MODEL_TENSOR.ATTN_POST_NORM: (
+                "model.layers.{bid}.post_attention_layernorm",
+            ),
+            MODEL_TENSOR.FFN_NORM: (
+                "model.layers.{bid}.ffn_norm",
+            ),
+        },
+        MODEL_ARCH.GEMMA4_MTP: {
+            MODEL_TENSOR.ATTN_POST_NORM: (
+                "model.layers.{bid}.post_attention_layernorm",
+            ),
+            MODEL_TENSOR.FFN_NORM: (
+                "model.layers.{bid}.ffn_norm",
+            ),
+        },
     }
 
     mapping: dict[str, tuple[MODEL_TENSOR, str]]
